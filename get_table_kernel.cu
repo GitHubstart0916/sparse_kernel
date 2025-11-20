@@ -22,6 +22,7 @@ __global__ void get_block_table_cuda(const int *topk_idx, const int *block_table
                                 int *out_block_table, const int seqlen_q_max,
                                 const int token_num) {
   int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token_idx >= token_num) return;
   int bs = token_to_bs[token_idx];
   int pos_in_bs = token_pos_in_bs[token_idx];
 
