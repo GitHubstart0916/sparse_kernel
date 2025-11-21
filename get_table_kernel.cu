@@ -20,27 +20,28 @@ __global__ void get_block_table_cuda(const int *topk_idx, const int *block_table
                                 const int *token_to_bs,
                                 const int *token_pos_in_bs, const int *seqlen_q,
                                 int *out_block_table, const int seqlen_q_max,
-                                const int token_num) {
+                                const int token_num,
+                               const int page_size=1) {
   int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (token_idx >= token_num) return;
   int bs = token_to_bs[token_idx];
   int pos_in_bs = token_pos_in_bs[token_idx];
 
   for (int h = 0; h < kHeadGroup; h++) {
-    for (int i = 0; i < kSparseTopK * kSparseBlockSize; i++) {
+    for (int i = 0; i < kSparseTopK * kSparseBlockSize / page_size; i++) {
       int sparse_block_idx =
           topk_idx[h * token_num * kSparseTopK + token_idx * kSparseTopK +
-                   i / kSparseBlockSize];
+                   i * page_size / kSparseBlockSize];
       if (sparse_block_idx < 0)
         continue;
       int token_idx_in_batch =
-          sparse_block_idx * kSparseBlockSize + (i % kSparseBlockSize);
+          sparse_block_idx * kSparseBlockSize + (i * page_size % kSparseBlockSize);
 
       if (token_idx_in_batch < seqlen_q[bs] && token_idx_in_batch < pos_in_bs) {
-        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize + h * kSparseTopK * kSparseBlockSize + i] =
-            kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] + h;
+        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize / page_size + h * kSparseTopK * kSparseBlockSize / page_size + i] =
+            kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch / page_size] + h;
       } else {
-        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize + h * kSparseTopK * kSparseBlockSize + i] = 0;
+        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize / page_size + h * kSparseTopK * kSparseBlockSize / page_size + i] = 0;
       }
     }
   }
