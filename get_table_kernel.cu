@@ -91,6 +91,8 @@ torch::Tensor get_block_table_wrapper(
         token_num
     );
 
+    cudaDeviceSynchronize(); // 确保 CUDA kernel 执行完成
+
     return out_block_table;
 }
 
