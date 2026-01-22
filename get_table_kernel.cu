@@ -2,6 +2,7 @@
 // #include <cuda_runtime.h>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 constexpr int kTokenNum = 8192;
 constexpr int kBs = 1;
 constexpr int kSeqlenQMax = 8192;
@@ -78,9 +79,11 @@ torch::Tensor get_block_table_wrapper(
   
     const int THREADS_PER_BLOCK = 256;
     const int NUM_BLOCKS = (token_num + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
 
     // 5. 调用 CUDA kernel
-    get_block_table_cuda<<<NUM_BLOCKS, THREADS_PER_BLOCK>>>(
+    get_block_table_cuda<<<NUM_BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
         topk_idx.data_ptr<int>(),
         block_table.data_ptr<int>(),
         token_to_bs.data_ptr<int>(),
@@ -91,7 +94,7 @@ torch::Tensor get_block_table_wrapper(
         token_num
     );
 
-    cudaDeviceSynchronize(); // 确保 CUDA kernel 执行完成
+    // cudaDeviceSynchronize();
 
     return out_block_table;
 }
