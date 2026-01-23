@@ -1,8 +1,8 @@
 // #include <bits/stdc++.h>
 // #include <cuda_runtime.h>
-#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/extension.h>
 constexpr int kTokenNum = 8192;
 constexpr int kBs = 1;
 constexpr int kSeqlenQMax = 8192;
@@ -17,13 +17,14 @@ constexpr int kSparseTopK = 96;
 // seqlen_q: [batch_size]: int32    [1]
 // out_block_table: [token_num, head_group, kSparseTopK * kSparseBlockSize]:
 // int32 [2, 8192, 96 * 64] seqlen_q_max: int
-__global__ void get_block_table_cuda(const int *topk_idx, const int *block_table,
-                                const int *token_to_bs,
-                                const int *token_pos_in_bs, const int *seqlen_q,
-                                int *out_block_table, const int seqlen_q_max,
-                                const int token_num) {
+__global__ void
+get_block_table_cuda(const int *topk_idx, const int *block_table,
+                     const int *token_to_bs, const int *token_pos_in_bs,
+                     const int *seqlen_q, int *out_block_table,
+                     const int seqlen_q_max, const int token_num) {
   int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (token_idx >= token_num) return;
+  if (token_idx >= token_num)
+    return;
   int bs = token_to_bs[token_idx];
   int pos_in_bs = token_pos_in_bs[token_idx];
 
@@ -38,68 +39,205 @@ __global__ void get_block_table_cuda(const int *topk_idx, const int *block_table
           sparse_block_idx * kSparseBlockSize + (i % kSparseBlockSize);
 
       if (token_idx_in_batch < seqlen_q[bs] && token_idx_in_batch < pos_in_bs) {
-        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize + h * kSparseTopK * kSparseBlockSize + i] =
-            kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] + h;
+        out_block_table[token_idx * kHeadGroup * kSparseTopK *
+                            kSparseBlockSize +
+                        h * kSparseTopK * kSparseBlockSize + i] =
+            kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] +
+            h;
       } else {
-        out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize + h * kSparseTopK * kSparseBlockSize + i] = 0;
+        out_block_table[token_idx * kHeadGroup * kSparseTopK *
+                            kSparseBlockSize +
+                        h * kSparseTopK * kSparseBlockSize + i] = 0;
       }
     }
   }
 }
 
+// 1 thread calc 64 element of out_block_table
+// This allows topk_idx to be read once and all corresponding
+// out_block_table elements calculated, reducing memory access
+__global__ void
+get_block_table_cuda_v2(const int *topk_idx, const int *block_table,
+                        const int *token_to_bs, const int *token_pos_in_bs,
+                        const int *seqlen_q, int *out_block_table,
+                        const int seqlen_q_max, const int token_num) {
+  int token_idx =
+      (blockIdx.x * blockDim.x + threadIdx.x) / (kSparseTopK * kHeadGroup);
+  if (token_idx >= token_num)
+    return;
+  int head_group_idx =
+      ((blockIdx.x * blockDim.x + threadIdx.x) / kSparseTopK) % kHeadGroup;
+  int topk_idx_in_head = (blockIdx.x * blockDim.x + threadIdx.x) % kSparseTopK;
+  int bs = token_to_bs[token_idx];
+  int pos_in_bs = token_pos_in_bs[token_idx];
+  int seqlen_q_bs = seqlen_q[bs];
+  int sparse_block_idx = topk_idx[head_group_idx * token_num * kSparseTopK +
+                                  token_idx * kSparseTopK + topk_idx_in_head];
 
+  if (sparse_block_idx < 0)
+    return;
+  for (int i = 0; i < kSparseBlockSize; i++) {
 
-torch::Tensor get_block_table_wrapper(
-    const torch::Tensor& topk_idx,        // [head_group, token_num, kSparseTopK]
-    const torch::Tensor& block_table,     // [batch_size, seqlen_q_max]
-    const torch::Tensor& token_to_bs,     // [token_num]
-    const torch::Tensor& token_pos_in_bs, // [token_num]
-    const torch::Tensor& seqlen_q         // [batch_size]
-) {
-    
-    TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
-    TORCH_CHECK(topk_idx.dtype() == torch::kInt, "All inputs must be int32");
-    
-    int token_num = topk_idx.size(1);
-    int seqlen_q_max = block_table.size(1);
-    const int batch_size = block_table.size(0);
-    const int BLOCK_SIZE = kSparseTopK * kSparseBlockSize;
+    int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i;
 
-    // 2. 验证输入张量形状
-    TORCH_CHECK(topk_idx.sizes() == torch::IntArrayRef({kHeadGroup, token_num, kSparseTopK}), "topk_idx shape incorrect");
-    TORCH_CHECK(block_table.sizes() == torch::IntArrayRef({batch_size, seqlen_q_max}), "block_table shape incorrect");
-    TORCH_CHECK(token_to_bs.size(0) == token_num, "token_to_bs size incorrect");
-    
-
-    torch::Tensor out_block_table = torch::zeros(
-        {token_num, kHeadGroup, BLOCK_SIZE}, 
-        topk_idx.options() // 继承 dtype 和 device
-    ).contiguous();
-
-  
-    const int THREADS_PER_BLOCK = 256;
-    const int NUM_BLOCKS = (token_num + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-
-    // 5. 调用 CUDA kernel
-    get_block_table_cuda<<<NUM_BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
-        topk_idx.data_ptr<int>(),
-        block_table.data_ptr<int>(),
-        token_to_bs.data_ptr<int>(),
-        token_pos_in_bs.data_ptr<int>(),
-        seqlen_q.data_ptr<int>(),
-        out_block_table.data_ptr<int>(),
-        seqlen_q_max,
-        token_num
-    );
-
-    // cudaDeviceSynchronize();
-
-    return out_block_table;
+    if (token_idx_in_batch < seqlen_q_bs && token_idx_in_batch < pos_in_bs) {
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
+                      head_group_idx * kSparseTopK * kSparseBlockSize +
+                      topk_idx_in_head * kSparseBlockSize + i] =
+          kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] +
+          head_group_idx;
+    } else {
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
+                      head_group_idx * kSparseTopK * kSparseBlockSize +
+                      topk_idx_in_head * kSparseBlockSize + i] = 0;
+    }
+  }
 }
 
+// opt for decode
+__global__ void
+get_block_table_cuda_v3(const int *topk_idx, const int *block_table,
+                        const int *token_to_bs, const int *token_pos_in_bs,
+                        const int *seqlen_q, int *out_block_table,
+                        const int seqlen_q_max, const int token_num) {
+
+  __shared__ int topk_idx_share[16];
+  if (threadIdx.x < 16) {
+    // read
+  }
+  int token_idx =
+      (blockIdx.x * blockDim.x + threadIdx.x) / (kSparseTopK * kHeadGroup);
+  if (token_idx >= token_num)
+    return;
+  int head_group_idx =
+      ((blockIdx.x * blockDim.x + threadIdx.x) / kSparseTopK) % kHeadGroup;
+  int topk_idx_in_head = (blockIdx.x * blockDim.x + threadIdx.x) % kSparseTopK;
+  int bs = token_to_bs[token_idx];
+  int pos_in_bs = token_pos_in_bs[token_idx];
+  int seqlen_q_bs = seqlen_q[bs];
+  int sparse_block_idx = topk_idx[head_group_idx * token_num * kSparseTopK +
+                                  token_idx * kSparseTopK + topk_idx_in_head];
+
+  if (sparse_block_idx < 0)
+    return;
+  for (int i = 0; i < kSparseBlockSize; i++) {
+
+    int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i;
+
+    if (token_idx_in_batch < seqlen_q_bs && token_idx_in_batch < pos_in_bs) {
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
+                      head_group_idx * kSparseTopK * kSparseBlockSize +
+                      topk_idx_in_head * kSparseBlockSize + i] =
+          kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] +
+          head_group_idx;
+    } else {
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
+                      head_group_idx * kSparseTopK * kSparseBlockSize +
+                      topk_idx_in_head * kSparseBlockSize + i] = 0;
+    }
+  }
+}
+
+torch::Tensor get_block_table_wrapper(
+    const torch::Tensor &topk_idx,    // [head_group, token_num, kSparseTopK]
+    const torch::Tensor &block_table, // [batch_size, seqlen_q_max]
+    const torch::Tensor &token_to_bs, // [token_num]
+    const torch::Tensor &token_pos_in_bs, // [token_num]
+    const torch::Tensor &seqlen_q         // [batch_size]
+) {
+
+  TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+  TORCH_CHECK(topk_idx.dtype() == torch::kInt, "All inputs must be int32");
+
+  int token_num = topk_idx.size(1);
+  int seqlen_q_max = block_table.size(1);
+  const int batch_size = block_table.size(0);
+  const int BLOCK_SIZE = kSparseTopK * kSparseBlockSize;
+
+  // 2. 验证输入张量形状
+  TORCH_CHECK(topk_idx.sizes() ==
+                  torch::IntArrayRef({kHeadGroup, token_num, kSparseTopK}),
+              "topk_idx shape incorrect");
+  TORCH_CHECK(block_table.sizes() ==
+                  torch::IntArrayRef({batch_size, seqlen_q_max}),
+              "block_table shape incorrect");
+  TORCH_CHECK(token_to_bs.size(0) == token_num, "token_to_bs size incorrect");
+
+  torch::Tensor out_block_table =
+      torch::zeros({token_num, kHeadGroup, BLOCK_SIZE},
+                   topk_idx.options() // 继承 dtype 和 device
+                   )
+          .contiguous();
+
+  const int THREADS_PER_BLOCK = 256;
+  const int NUM_BLOCKS =
+      (token_num + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // 5. 调用 CUDA kernel
+  get_block_table_cuda<<<NUM_BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
+      topk_idx.data_ptr<int>(), block_table.data_ptr<int>(),
+      token_to_bs.data_ptr<int>(), token_pos_in_bs.data_ptr<int>(),
+      seqlen_q.data_ptr<int>(), out_block_table.data_ptr<int>(), seqlen_q_max,
+      token_num);
+
+  // cudaDeviceSynchronize();
+
+  return out_block_table;
+}
+
+torch::Tensor get_block_table_wrapper_v2(
+    const torch::Tensor &topk_idx,    // [head_group, token_num, kSparseTopK]
+    const torch::Tensor &block_table, // [batch_size, seqlen_q_max]
+    const torch::Tensor &token_to_bs, // [token_num]
+    const torch::Tensor &token_pos_in_bs, // [token_num]
+    const torch::Tensor &seqlen_q         // [batch_size]
+) {
+
+  TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
+  TORCH_CHECK(topk_idx.dtype() == torch::kInt, "All inputs must be int32");
+
+  int token_num = topk_idx.size(1);
+  int seqlen_q_max = block_table.size(1);
+  const int batch_size = block_table.size(0);
+  const int BLOCK_SIZE = kSparseTopK * kSparseBlockSize;
+
+  // 2. 验证输入张量形状
+  TORCH_CHECK(topk_idx.sizes() ==
+                  torch::IntArrayRef({kHeadGroup, token_num, kSparseTopK}),
+              "topk_idx shape incorrect");
+  TORCH_CHECK(block_table.sizes() ==
+                  torch::IntArrayRef({batch_size, seqlen_q_max}),
+              "block_table shape incorrect");
+  TORCH_CHECK(token_to_bs.size(0) == token_num, "token_to_bs size incorrect");
+
+  torch::Tensor out_block_table =
+      torch::zeros({token_num, kHeadGroup, BLOCK_SIZE},
+                   topk_idx.options() // 继承 dtype 和 device
+                   )
+          .contiguous();
+
+  const int THREADS_PER_BLOCK = 1024;
+  const int NUM_BLOCKS =
+      (token_num * kHeadGroup * kSparseTopK + THREADS_PER_BLOCK - 1) /
+      THREADS_PER_BLOCK;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  // 5. 调用 CUDA kernel
+  get_block_table_cuda_v2<<<NUM_BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
+      topk_idx.data_ptr<int>(), block_table.data_ptr<int>(),
+      token_to_bs.data_ptr<int>(), token_pos_in_bs.data_ptr<int>(),
+      seqlen_q.data_ptr<int>(), out_block_table.data_ptr<int>(), seqlen_q_max,
+      token_num);
+
+  // cudaDeviceSynchronize();
+
+  return out_block_table;
+}
 // --- 4. PyTorch 扩展模块注册 ---
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("get_block_table", &get_block_table_wrapper, "Sparse Attention Block Table Getter (CUDA)");
+  m.def("get_block_table", &get_block_table_wrapper,
+        "Sparse Attention Block Table Getter (CUDA)");
+  m.def("get_block_table_v2", &get_block_table_wrapper_v2,
+        "Sparse Attention Block Table Getter (CUDA)");
 }
