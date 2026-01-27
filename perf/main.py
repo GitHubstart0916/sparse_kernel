@@ -47,6 +47,13 @@ for _ in range(10):
         seqlen_q,
         seqlen_q
     )
+    sparse_kernel_extension.get_block_table_v3(
+        topk_idx,
+        block_table,
+        token_to_bs,
+        seqlen_q,
+        seqlen_q
+    )
 
 
 try:
@@ -79,9 +86,29 @@ try:
 
 except Exception as e:
     print(f"Error during kernel execution: {e}")
-    
+
+try:
+    out_block_table_v3 = sparse_kernel_extension.get_block_table_v3(
+        topk_idx,
+        block_table,
+        token_to_bs,
+        seqlen_q,
+        seqlen_q
+    )
+    print("Kernel executed successfully.")
+    print(f"Output shape: {out_block_table_v3.shape}") 
+
+except Exception as e:
+    print(f"Error during kernel execution: {e}")
+
 if torch.allclose(out_block_table_v1, out_block_table_v2):
-    print("Outputs from both versions are identical.")
+    print("Outputs from v2 are identical.")
 else:
-    print("Outputs from both versions differ.")
+    print("Outputs from v2 differ.")
+    
+if torch.allclose(out_block_table_v1, out_block_table_v3):
+    print("Outputs from v3 are identical.")
+else:
+    print("Outputs from v3 differ.")
+    
     
