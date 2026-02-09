@@ -4,7 +4,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
-supported_archs = ["80", "90"]
+supported_archs = ["80", "90", "120"]
 cc_flag = []
 for arch in supported_archs:
     cc_flag.extend(["-gencode", f"arch=compute_{arch},code=sm_{arch}"])
