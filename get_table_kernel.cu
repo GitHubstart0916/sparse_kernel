@@ -66,8 +66,8 @@ __global__ void
 get_block_table_cuda_v2(const int *topk_idx, const int *block_table,
                         const int *token_to_bs, const int *token_pos_in_bs,
                         const int *seqlen_q, int *out_block_table,
-                        const int seqlen_q_max, const int token_num) {
-  constexpr int kBlockPerTokenHead = kSparseTopK / kTopkPerBlock;
+                        const int max_num_blocks, const int token_num,
+                        const int page_size) {
   int token_idx =
       (blockIdx.x * blockDim.x + threadIdx.x) / (kSparseTopK * kHeadGroup);
   if (token_idx >= token_num)
@@ -83,20 +83,22 @@ get_block_table_cuda_v2(const int *topk_idx, const int *block_table,
 
   if (sparse_block_idx < 0)
     return;
-  for (int i = 0; i < kSparseBlockSize; i++) {
+  int num_blocks_per_sparse_block = kSparseBlockSize / page_size;
+  for (int i = 0; i < num_blocks_per_sparse_block; i++) {
 
-    int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i;
+    int token_idx_in_batch = sparse_block_idx * kSparseBlockSize + i * page_size;
+    int page_idx_in_batch = token_idx_in_batch / page_size;
 
     if (token_idx_in_batch < seqlen_q_bs && token_idx_in_batch < pos_in_bs) {
-      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
-                      head_group_idx * kSparseTopK * kSparseBlockSize +
-                      topk_idx_in_head * kSparseBlockSize + i] =
-          kHeadGroup * block_table[bs * seqlen_q_max + token_idx_in_batch] +
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * num_blocks_per_sparse_block +
+                      head_group_idx * kSparseTopK * num_blocks_per_sparse_block +
+                      topk_idx_in_head * num_blocks_per_sparse_block + i] =
+          kHeadGroup * block_table[bs * max_num_blocks + page_idx_in_batch] +
           head_group_idx;
     } else {
-      out_block_table[token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
-                      head_group_idx * kSparseTopK * kSparseBlockSize +
-                      topk_idx_in_head * kSparseBlockSize + i] = 0;
+      out_block_table[token_idx * kHeadGroup * kSparseTopK * num_blocks_per_sparse_block +
+                      head_group_idx * kSparseTopK * num_blocks_per_sparse_block +
+                      topk_idx_in_head * num_blocks_per_sparse_block + i] = 0;
     }
   }
 }
@@ -202,25 +204,26 @@ torch::Tensor get_block_table_v1_wrapper(
 
 torch::Tensor get_block_table_v2_wrapper(
     const torch::Tensor &topk_idx,    // [head_group, token_num, kSparseTopK]
-    const torch::Tensor &block_table, // [batch_size, seqlen_q_max]
+    const torch::Tensor &block_table, // [batch_size, max_num_blocks]
     const torch::Tensor &token_to_bs, // [token_num]
     const torch::Tensor &token_pos_in_bs, // [token_num]
     const torch::Tensor &seqlen_q,        // [batch_size]
-    const int topk) {
+    const int topk,
+    const int page_size) {
 
   TORCH_CHECK(topk_idx.is_cuda(), "topk_idx must be a CUDA tensor");
   TORCH_CHECK(topk_idx.dtype() == torch::kInt, "All inputs must be int32");
 
   int token_num = topk_idx.size(1);
-  int seqlen_q_max = block_table.size(1);
+  int max_num_blocks = block_table.size(1);
   const int batch_size = block_table.size(0);
-  const int BLOCK_SIZE = topk * kSparseBlockSize;
+  const int BLOCK_SIZE = topk * kSparseBlockSize / page_size;
 
   TORCH_CHECK(topk_idx.sizes() ==
                   torch::IntArrayRef({kHeadGroup, token_num, topk}),
               "topk_idx shape incorrect");
   TORCH_CHECK(block_table.sizes() ==
-                  torch::IntArrayRef({batch_size, seqlen_q_max}),
+                  torch::IntArrayRef({batch_size, max_num_blocks}),
               "block_table shape incorrect");
   TORCH_CHECK(token_to_bs.size(0) == token_num, "token_to_bs size incorrect");
 
@@ -241,8 +244,8 @@ torch::Tensor get_block_table_v2_wrapper(
     kernel<<<NUM_BLOCKS, THREADS_PER_BLOCK, 0, stream>>>(
         topk_idx.data_ptr<int>(), block_table.data_ptr<int>(),
         token_to_bs.data_ptr<int>(), token_pos_in_bs.data_ptr<int>(),
-        seqlen_q.data_ptr<int>(), out_block_table.data_ptr<int>(), seqlen_q_max,
-        token_num);
+        seqlen_q.data_ptr<int>(), out_block_table.data_ptr<int>(), max_num_blocks,
+        token_num, page_size);
   });
 
   // cudaDeviceSynchronize();
